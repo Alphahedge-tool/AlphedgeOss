@@ -5,6 +5,136 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Cell,
 } from 'recharts';
 
+// ── RESIZABLE PANELS ─────────────────────────────────────────────────────────
+
+// DOM-driven resize — no React setState during drag, zero jank.
+// The left/top panel is mutated directly via element.style; React state
+// is only synced on mouseup so the next render starts at the right size.
+
+function useResizeH(defaultPct: number, minPct = 15, maxPct = 85) {
+  const [pct, setPct] = useState(defaultPct);
+  const pctRef = useRef(defaultPct);          // live value during drag
+  const containerRef = useRef<HTMLDivElement>(null);
+  const leftPanelRef = useRef<HTMLDivElement>(null); // panel whose width we mutate
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX   = e.clientX;
+    const startPct = pctRef.current;
+    document.body.classList.add('resizing-h');
+
+    function onMove(ev: MouseEvent) {
+      if (!containerRef.current || !leftPanelRef.current) return;
+      const totalW = containerRef.current.offsetWidth;
+      const next   = Math.min(maxPct, Math.max(minPct, startPct + ((ev.clientX - startX) / totalW) * 100));
+      pctRef.current = next;
+      // mutate DOM directly — no React render
+      leftPanelRef.current.style.width = `${next}%`;
+    }
+    function onUp() {
+      document.body.classList.remove('resizing-h');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setPct(pctRef.current); // sync React state once on release
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [minPct, maxPct]);
+
+  return { pct, pctRef, containerRef, leftPanelRef, onMouseDown };
+}
+
+function useResizeV(defaultPx: number, minPx = 60, maxPx = 600) {
+  const [px, setPx] = useState(defaultPx);
+  const pxRef = useRef(defaultPx);
+  const rowRef = useRef<HTMLDivElement>(null); // row whose height we mutate
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startY  = e.clientY;
+    const startPx = pxRef.current;
+    document.body.classList.add('resizing-v');
+
+    function onMove(ev: MouseEvent) {
+      if (!rowRef.current) return;
+      const next = Math.min(maxPx, Math.max(minPx, startPx + (ev.clientY - startY)));
+      pxRef.current = next;
+      rowRef.current.style.height = `${next}px`;
+    }
+    function onUp() {
+      document.body.classList.remove('resizing-v');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setPx(pxRef.current);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [minPx, maxPx]);
+
+  return { px, rowRef, onMouseDown };
+}
+
+// Inline IV-panel width hook (px, not %)
+function useResizePxH(defaultPx: number, minPx = 120, maxPx = 440) {
+  const [px, setPx] = useState(defaultPx);
+  const pxRef  = useRef(defaultPx);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX  = e.clientX;
+    const startPx = pxRef.current;
+    document.body.classList.add('resizing-h');
+
+    function onMove(ev: MouseEvent) {
+      if (!panelRef.current) return;
+      const next = Math.min(maxPx, Math.max(minPx, startPx + (ev.clientX - startX)));
+      pxRef.current = next;
+      panelRef.current.style.width = `${next}px`;
+    }
+    function onUp() {
+      document.body.classList.remove('resizing-h');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setPx(pxRef.current);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [minPx, maxPx]);
+
+  return { px, panelRef, onMouseDown };
+}
+
+function ResizeHandleH({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  return (
+    <div
+      ref={ref}
+      className="resize-h"
+      onMouseDown={e => {
+        ref.current?.classList.add('dragging');
+        onMouseDown(e);
+        window.addEventListener('mouseup', () => ref.current?.classList.remove('dragging'), { once: true });
+      }}
+    />
+  );
+}
+
+function ResizeHandleV({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  return (
+    <div
+      ref={ref}
+      className="resize-v"
+      onMouseDown={e => {
+        ref.current?.classList.add('dragging');
+        onMouseDown(e);
+        window.addEventListener('mouseup', () => ref.current?.classList.remove('dragging'), { once: true });
+      }}
+    />
+  );
+}
+
 type AuthMethod = 'otp' | 'totp';
 type AuthStep = 'start' | 'otp' | 'totp' | 'mpin' | 'success';
 type Environment = 'PROD' | 'UAT';
@@ -460,13 +590,20 @@ function OptionsDesk({
   const [ivRank, setIVRank] = useState<IVRankData | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
-  const [strikes, setStrikes] = useState(10); // strikes around ATM
+  const [strikes, setStrikes] = useState(10);
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const ACCENT = 'rgb(120,201,255)';
   const NEG    = 'rgb(241,66,66)';
   const POS    = 'rgb(124,207,94)';
   const AMBER  = '#f59e0b';
+
+  // ── Panel resize state (all DOM-driven — no render during drag) ──────────
+  const chartsRow    = useResizeH(50, 20, 80);   // left chart / right chart (%)
+  const bottomSplit  = useResizeH(50, 20, 80);   // Greeks / OI Area (%)
+  const chartsHeight = useResizeV(260, 140, 520); // top charts row height (px)
+  const bottomHeight = useResizeV(230, 120, 480); // bottom row height (px)
+  const ivPanel      = useResizePxH(220, 140, 400); // IV Rank panel width (px)
 
   const headers = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -691,18 +828,20 @@ function OptionsDesk({
             ))}
           </div>
 
-          {/* ── CHARTS ROW ── */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-
+          {/* ── CHARTS ROW (resizable left/right + height) ── */}
+          <div
+            ref={(el) => { (chartsRow.containerRef as React.MutableRefObject<HTMLDivElement | null>).current = el; (chartsHeight.rowRef as React.MutableRefObject<HTMLDivElement | null>).current = el; }}
+            style={{ display: 'flex', gap: 0, position: 'relative', height: chartsHeight.px }}
+          >
             {/* OI BAR CHART */}
-            <div style={PANEL}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div ref={chartsRow.leftPanelRef} className="resizable-panel" style={{ ...PANEL, width: `${chartsRow.pct}%`, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
                 <div><div style={EYE}>Open Interest</div><div style={TTL}>CE vs PE OI by Strike</div></div>
                 <div style={{ display: 'flex', gap: 12 }}>
                   <LEGEND color="#4ade80" label="Call OI" /><LEGEND color="#f87171" label="Put OI" /><LEGEND color="#7dd3fc" label="ATM" />
                 </div>
               </div>
-              <ResponsiveContainer width="100%" height={220}>
+              <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={oiData} margin={{ top: 2, right: 4, left: 4, bottom: 0 }} barCategoryGap="20%" barGap={1}>
                   <CartesianGrid vertical={false} stroke={GC} strokeDasharray="3 4" />
                   <XAxis dataKey="strike" tick={TX} tickFormatter={fmtStrike} interval="preserveStartEnd" axisLine={false} tickLine={false} />
@@ -718,11 +857,12 @@ function OptionsDesk({
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
+              <ResizeHandleH onMouseDown={chartsRow.onMouseDown} />
             </div>
 
             {/* IV SMILE */}
-            <div style={PANEL}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div className="resizable-panel" style={{ ...PANEL, flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
                 <div>
                   <div style={EYE}>Implied Volatility</div>
                   <div style={TTL}>IV Skew — Calls & Puts</div>
@@ -732,7 +872,7 @@ function OptionsDesk({
                 </div>
               </div>
               {ivSmileData.length > 0 ? (
-                <ResponsiveContainer width="100%" height={220}>
+                <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={ivSmileData} margin={{ top: 4, right: 8, left: 4, bottom: 0 }}>
                     <CartesianGrid stroke={GC} strokeDasharray="3 4" />
                     <XAxis dataKey="strike" tick={TX} tickFormatter={fmtStrike} interval="preserveStartEnd" axisLine={false} tickLine={false} />
@@ -745,19 +885,24 @@ function OptionsDesk({
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
-                <div style={{ height: 220, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: '#334155' }}>
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: '#334155' }}>
                   <svg width={32} height={32} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}><path d="M3 3l18 18M9 9c0-1.66 1.34-3 3-3 .34 0 .67.06.98.16M12 15c-1.66 0-3-1.34-3-3M15 12a3 3 0 00-3-3"/></svg>
                   <span style={{ fontSize: 12, fontFamily: 'Inter, sans-serif' }}>No IV data for this expiry</span>
                 </div>
               )}
             </div>
+
+            {/* vertical drag handle — resizes charts row height */}
+            <ResizeHandleV onMouseDown={chartsHeight.onMouseDown} />
           </div>
 
-          {/* ── BOTTOM ROW: IV Rank + Greeks + OI Area ── */}
-          <div style={{ display: 'grid', gridTemplateColumns: '210px 1fr 1fr', gap: 8 }}>
-
-            {/* IV RANK */}
-            <div style={{ ...PANEL, justifyContent: 'flex-start' }}>
+          {/* ── BOTTOM ROW: IV Rank + Greeks + OI Area (all resizable) ── */}
+          <div
+            ref={bottomHeight.rowRef}
+            style={{ display: 'flex', gap: 0, position: 'relative', height: bottomHeight.px }}
+          >
+            {/* IV RANK — drag right edge to resize width */}
+            <div ref={ivPanel.panelRef} className="resizable-panel" style={{ ...PANEL, width: ivPanel.px, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div style={EYE}>Volatility Regime</div>
               <div style={{ ...TTL, marginBottom: 6 }}>IV Rank</div>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
@@ -766,53 +911,64 @@ function OptionsDesk({
                   <p style={{ fontSize: 10.5, color: '#94a3b8', textAlign: 'center', lineHeight: 1.6, maxWidth: 180, fontFamily: "'Inter', sans-serif", fontWeight: 400 }}>{ivRank.message}</p>
                 </> : <span style={{ color: '#64748b', fontSize: 12, fontFamily: "'Inter', sans-serif" }}>Load data to compute</span>}
               </div>
+              <ResizeHandleH onMouseDown={ivPanel.onMouseDown} />
             </div>
 
-            {/* GREEKS */}
-            <div style={PANEL}>
-              <div style={EYE}>ATM Call — Sensitivities</div>
-              <div style={TTL}>Greeks</div>
-              <ResponsiveContainer width="100%" height={170}>
-                <BarChart data={greeksData} layout="vertical" margin={{ top: 2, right: 20, left: 12, bottom: 2 }}>
-                  <CartesianGrid horizontal={false} stroke={GC} strokeDasharray="3 4" />
-                  <XAxis type="number" tick={TX} axisLine={false} tickLine={false} />
-                  <YAxis type="category" dataKey="name" tick={{ ...TX, fontSize: 11, fill: '#cbd5e1' }} width={44} axisLine={false} tickLine={false} />
-                  <Tooltip content={<ChartTooltip />} />
-                  <Bar dataKey="value" name="Value" radius={[0,4,4,0]}>
-                    {greeksData.map((_,i) => <Cell key={i} fill={['#7dd3fc','#4ade80','#f87171','#fbbf24'][i%4]} fillOpacity={0.88} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-
-            {/* OI AREA */}
-            <div style={PANEL}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                <div><div style={EYE}>OI Distribution</div><div style={TTL}>CE vs PE — Overlap View</div></div>
-                <div style={{ display: 'flex', gap: 10 }}><LEGEND color="#4ade80" label="CE" /><LEGEND color="#f87171" label="PE" /></div>
+            {/* Greeks + OI Area split */}
+            <div
+              ref={bottomSplit.containerRef}
+              style={{ flex: 1, minWidth: 0, display: 'flex', gap: 0, position: 'relative' }}
+            >
+              {/* GREEKS */}
+              <div ref={bottomSplit.leftPanelRef} className="resizable-panel" style={{ ...PANEL, width: `${bottomSplit.pct}%`, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                <div style={{ ...EYE, flexShrink: 0 }}>ATM Call — Sensitivities</div>
+                <div style={{ ...TTL, flexShrink: 0 }}>Greeks</div>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={greeksData} layout="vertical" margin={{ top: 2, right: 20, left: 12, bottom: 2 }}>
+                    <CartesianGrid horizontal={false} stroke={GC} strokeDasharray="3 4" />
+                    <XAxis type="number" tick={TX} axisLine={false} tickLine={false} />
+                    <YAxis type="category" dataKey="name" tick={{ ...TX, fontSize: 11, fill: '#cbd5e1' }} width={44} axisLine={false} tickLine={false} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Bar dataKey="value" name="Value" radius={[0,4,4,0]}>
+                      {greeksData.map((_,i) => <Cell key={i} fill={['#7dd3fc','#4ade80','#f87171','#fbbf24'][i%4]} fillOpacity={0.88} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+                <ResizeHandleH onMouseDown={bottomSplit.onMouseDown} />
               </div>
-              <ResponsiveContainer width="100%" height={170}>
-                <AreaChart data={oiData} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%"   stopColor="#4ade80" stopOpacity={0.4} />
-                      <stop offset="100%" stopColor="#4ade80" stopOpacity={0.02} />
-                    </linearGradient>
-                    <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%"   stopColor="#f87171" stopOpacity={0.4} />
-                      <stop offset="100%" stopColor="#f87171" stopOpacity={0.02} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid stroke={GC} strokeDasharray="3 4" />
-                  <XAxis dataKey="strike" tick={TX} tickFormatter={fmtStrike} interval="preserveStartEnd" axisLine={false} tickLine={false} />
-                  <YAxis tick={TX} tickFormatter={fmtK} width={44} axisLine={false} tickLine={false} />
-                  <Tooltip content={<ChartTooltip suffix="L" labelFormatter={fmtStrikeLabel} />} />
-                  <ReferenceLine x={atmStrike} stroke="#7dd3fc" strokeDasharray="4 3" strokeWidth={1} />
-                  <Area dataKey="ceOI" name="CE OI" stroke="#4ade80" fill="url(#g1)" strokeWidth={2} dot={false} />
-                  <Area dataKey="peOI" name="PE OI" stroke="#f87171" fill="url(#g2)" strokeWidth={2} dot={false} />
-                </AreaChart>
-              </ResponsiveContainer>
+
+              {/* OI AREA */}
+              <div className="resizable-panel" style={{ ...PANEL, flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexShrink: 0 }}>
+                  <div><div style={EYE}>OI Distribution</div><div style={TTL}>CE vs PE — Overlap View</div></div>
+                  <div style={{ display: 'flex', gap: 10 }}><LEGEND color="#4ade80" label="CE" /><LEGEND color="#f87171" label="PE" /></div>
+                </div>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={oiData} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%"   stopColor="#4ade80" stopOpacity={0.4} />
+                        <stop offset="100%" stopColor="#4ade80" stopOpacity={0.02} />
+                      </linearGradient>
+                      <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%"   stopColor="#f87171" stopOpacity={0.4} />
+                        <stop offset="100%" stopColor="#f87171" stopOpacity={0.02} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid stroke={GC} strokeDasharray="3 4" />
+                    <XAxis dataKey="strike" tick={TX} tickFormatter={fmtStrike} interval="preserveStartEnd" axisLine={false} tickLine={false} />
+                    <YAxis tick={TX} tickFormatter={fmtK} width={44} axisLine={false} tickLine={false} />
+                    <Tooltip content={<ChartTooltip suffix="L" labelFormatter={fmtStrikeLabel} />} />
+                    <ReferenceLine x={atmStrike} stroke="#7dd3fc" strokeDasharray="4 3" strokeWidth={1} />
+                    <Area dataKey="ceOI" name="CE OI" stroke="#4ade80" fill="url(#g1)" strokeWidth={2} dot={false} />
+                    <Area dataKey="peOI" name="PE OI" stroke="#f87171" fill="url(#g2)" strokeWidth={2} dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
             </div>
+
+            {/* vertical drag handle — resizes bottom row height */}
+            <ResizeHandleV onMouseDown={bottomHeight.onMouseDown} />
           </div>
 
           {/* ── CHAIN TABLE ── */}
