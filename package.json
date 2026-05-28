@@ -1,0 +1,29 @@
+{
+  "name": "alphedge-oss",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 8888",
+    "server:go": "cd go-backend && go run .",
+    "dev:all": "concurrently \"npm run dev\" \"npm run server:go\"",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 8888"
+  },
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "lucide-react": "^0.576.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^3.8.1",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
+  }
+}
