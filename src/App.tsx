@@ -544,6 +544,525 @@ function ChartTooltip({ active, payload, label, prefix = '', suffix = '', labelF
   );
 }
 
+// ── AI DIGEST ENGINE ─────────────────────────────────────────────────────────
+
+interface DigestSignal {
+  id: string;
+  time: string;
+  type: 'bullish' | 'bearish' | 'neutral' | 'alert';
+  category: string;
+  title: string;
+  body: string;
+  strike?: number;
+  value?: string;
+  bars?: { label: string; val: number; max: number; color: string }[];
+  tags?: string[];
+}
+
+interface DigestSummary {
+  bias: 'bullish' | 'bearish' | 'neutral';
+  score: number; // -100 to +100
+  bullCount: number;
+  bearCount: number;
+}
+
+function buildDigest(
+  chain: OptionChainData,
+  ivRank: IVRankData | null,
+  spot: number,
+): { signals: DigestSignal[]; summary: DigestSummary } {
+  const signals: DigestSignal[] = [];
+  const now = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const atm = chain.atm;
+
+  // ── 1. OI Walls ──────────────────────────────────────────────────────────
+  const ceByOI = [...chain.ce].sort((a, b) => b.oi - a.oi);
+  const peByOI = [...chain.pe].sort((a, b) => b.oi - a.oi);
+  const ceMaxOI = ceByOI[0]; const peMaxOI = peByOI[0];
+  const ce2nd = ceByOI[1];   const pe2nd = peByOI[1];
+  signals.push({
+    id: 'oi-walls', time: now, type: 'neutral', category: 'OI WALLS',
+    title: 'Call & Put OI Walls',
+    body: `Primary call wall ₹${ceMaxOI.strike.toLocaleString('en-IN')} (${(ceMaxOI.oi/1e5).toFixed(1)}L) acts as resistance. Primary put wall ₹${peMaxOI.strike.toLocaleString('en-IN')} (${(peMaxOI.oi/1e5).toFixed(1)}L) acts as support.${ce2nd ? ` Secondary CE wall at ₹${ce2nd.strike.toLocaleString('en-IN')}.` : ''}${pe2nd ? ` Secondary PE wall at ₹${pe2nd.strike.toLocaleString('en-IN')}.` : ''}`,
+    strike: ceMaxOI.strike,
+    value: `CE ${(ceMaxOI.oi/1e5).toFixed(1)}L`,
+    bars: [
+      { label: `CE ₹${ceMaxOI.strike.toLocaleString('en-IN')}`, val: ceMaxOI.oi/1e5, max: Math.max(ceMaxOI.oi, peMaxOI.oi)/1e5, color: '#4ade80' },
+      { label: `PE ₹${peMaxOI.strike.toLocaleString('en-IN')}`, val: peMaxOI.oi/1e5, max: Math.max(ceMaxOI.oi, peMaxOI.oi)/1e5, color: '#f87171' },
+    ],
+    tags: [`Resist ₹${ceMaxOI.strike.toLocaleString('en-IN')}`, `Support ₹${peMaxOI.strike.toLocaleString('en-IN')}`],
+  });
+
+  // ── 2. CE OI Change ───────────────────────────────────────────────────────
+  const ceAdded = chain.ce.filter(l => l.oi_chg > 0).sort((a, b) => b.oi_chg - a.oi_chg);
+  const ceTop = ceAdded[0];
+  if (ceTop) {
+    const isBearish = ceTop.strike > atm;
+    const ceUnwound = chain.ce.filter(l => l.oi_chg < 0).sort((a, b) => a.oi_chg - b.oi_chg)[0];
+    signals.push({
+      id: 'oi-chg-ce', time: now, type: isBearish ? 'bearish' : 'neutral', category: 'CE OI CHANGE',
+      title: isBearish ? 'Fresh Call Writing — Cap Building' : 'CE OI Addition Below ATM',
+      body: `Largest CE build at ₹${ceTop.strike.toLocaleString('en-IN')}: +${(ceTop.oi_chg/1e3).toFixed(1)}K lots (${((ceTop.oi_chg/ceTop.oi)*100).toFixed(1)}% of strike OI). ${isBearish ? 'Sellers capping upside near resistance.' : 'Build below ATM — limited directional signal.'}${ceUnwound ? ` Unwinding at ₹${ceUnwound.strike.toLocaleString('en-IN')} (${(ceUnwound.oi_chg/1e3).toFixed(1)}K).` : ''}`,
+      strike: ceTop.strike, value: `+${(ceTop.oi_chg/1e3).toFixed(1)}K`,
+      bars: ceAdded.slice(0, 3).map(l => ({ label: `₹${l.strike.toLocaleString('en-IN')}`, val: l.oi_chg/1e3, max: ceTop.oi_chg/1e3, color: '#f87171' })),
+      tags: isBearish ? ['Call Writing', 'Resistance'] : ['CE Build', 'Watch'],
+    });
+  }
+
+  // ── 3. PE OI Change ───────────────────────────────────────────────────────
+  const peAdded = chain.pe.filter(l => l.oi_chg > 0).sort((a, b) => b.oi_chg - a.oi_chg);
+  const peTop = peAdded[0];
+  if (peTop) {
+    const isBullish = peTop.strike < atm;
+    const peUnwound = chain.pe.filter(l => l.oi_chg < 0).sort((a, b) => a.oi_chg - b.oi_chg)[0];
+    signals.push({
+      id: 'oi-chg-pe', time: now, type: isBullish ? 'bullish' : 'neutral', category: 'PE OI CHANGE',
+      title: isBullish ? 'Fresh Put Writing — Floor Building' : 'PE OI Addition Above ATM',
+      body: `Largest PE build at ₹${peTop.strike.toLocaleString('en-IN')}: +${(peTop.oi_chg/1e3).toFixed(1)}K lots (${((peTop.oi_chg/peTop.oi)*100).toFixed(1)}% of strike OI). ${isBullish ? 'Sellers underwriting the downside — bullish support.' : 'Build above ATM — possible bearish hedge.'}${peUnwound ? ` Unwinding at ₹${peUnwound.strike.toLocaleString('en-IN')} (${(peUnwound.oi_chg/1e3).toFixed(1)}K).` : ''}`,
+      strike: peTop.strike, value: `+${(peTop.oi_chg/1e3).toFixed(1)}K`,
+      bars: peAdded.slice(0, 3).map(l => ({ label: `₹${l.strike.toLocaleString('en-IN')}`, val: l.oi_chg/1e3, max: peTop.oi_chg/1e3, color: '#4ade80' })),
+      tags: isBullish ? ['Put Writing', 'Support'] : ['PE Build', 'Watch'],
+    });
+  }
+
+  // ── 4. PCR ────────────────────────────────────────────────────────────────
+  const pcr = chain.pcr;
+  const pcrType = pcr > 1.3 ? 'bullish' : pcr < 0.75 ? 'bearish' : 'neutral';
+  signals.push({
+    id: 'pcr', time: now, type: pcrType, category: 'PUT-CALL RATIO',
+    title: pcr > 1.3 ? `PCR ${pcr.toFixed(2)} — Heavy Put Writing` : pcr < 0.75 ? `PCR ${pcr.toFixed(2)} — Heavy Call Writing` : `PCR ${pcr.toFixed(2)} — Balanced`,
+    body: pcr > 1.3
+      ? `PCR ${pcr.toFixed(3)} is above 1.30 — puts substantially outnumber calls. Institutions writing puts signals conviction on downside support. Contrarian bullish reading.`
+      : pcr < 0.75
+      ? `PCR ${pcr.toFixed(3)} below 0.75 — calls outnumber puts. Heavy call writing or put unwinding signals bearish sentiment. Risk of further downside.`
+      : `PCR ${pcr.toFixed(3)} in neutral band (0.75–1.30). CE OI: ${(chain.total_ce_oi/1e5).toFixed(1)}L vs PE OI: ${(chain.total_pe_oi/1e5).toFixed(1)}L. No strong bias.`,
+    value: pcr.toFixed(3),
+    tags: [pcr > 1.3 ? 'Put-Heavy' : pcr < 0.75 ? 'Call-Heavy' : 'Balanced', `CE ${(chain.total_ce_oi/1e5).toFixed(0)}L`, `PE ${(chain.total_pe_oi/1e5).toFixed(0)}L`],
+  });
+
+  // ── 5. IV Skew ────────────────────────────────────────────────────────────
+  const otmPuts  = chain.pe.filter(l => l.strike < atm && l.iv > 0).sort((a, b) => b.strike - a.strike);
+  const otmCalls = chain.ce.filter(l => l.strike > atm && l.iv > 0).sort((a, b) => a.strike - b.strike);
+  if (otmPuts.length >= 2 && otmCalls.length >= 2) {
+    const avgPutIV  = otmPuts.slice(0, 4).reduce((s, l) => s + l.iv, 0) / Math.min(4, otmPuts.length);
+    const avgCallIV = otmCalls.slice(0, 4).reduce((s, l) => s + l.iv, 0) / Math.min(4, otmCalls.length);
+    const skew = avgPutIV - avgCallIV;
+    const atmIV = chain.ce.find(l => l.strike === atm)?.iv ?? avgCallIV;
+    signals.push({
+      id: 'iv-skew', time: now,
+      type: skew > 0.015 ? 'bearish' : skew < -0.01 ? 'bullish' : 'neutral', category: 'IV SKEW',
+      title: skew > 0.015 ? 'Put Skew Elevated — Fear Premium' : skew < -0.01 ? 'Call Skew Elevated — Upside Bid' : 'IV Smile Symmetric',
+      body: skew > 0.015
+        ? `OTM put IV averaging ${(avgPutIV*100).toFixed(1)}% vs call IV ${(avgCallIV*100).toFixed(1)}%. Skew of ${(skew*100).toFixed(1)}% shows market pricing tail-risk protection. ATM IV: ${(atmIV*100).toFixed(1)}%.`
+        : skew < -0.01
+        ? `OTM call IV averaging ${(avgCallIV*100).toFixed(1)}% vs put IV ${(avgPutIV*100).toFixed(1)}%. Positive call skew — demand for upside calls, breakout positioning.`
+        : `Put IV ${(avgPutIV*100).toFixed(1)}% ≈ Call IV ${(avgCallIV*100).toFixed(1)}%. Symmetric smile — no fear premium. ATM IV: ${(atmIV*100).toFixed(1)}%.`,
+      value: `Δ${(skew*100).toFixed(1)}%`,
+      bars: [
+        { label: 'Put IV', val: avgPutIV*100, max: Math.max(avgPutIV, avgCallIV)*100 * 1.1, color: '#f87171' },
+        { label: 'ATM IV', val: atmIV*100, max: Math.max(avgPutIV, avgCallIV)*100 * 1.1, color: '#7dd3fc' },
+        { label: 'Call IV', val: avgCallIV*100, max: Math.max(avgPutIV, avgCallIV)*100 * 1.1, color: '#4ade80' },
+      ],
+      tags: [`Put ${(avgPutIV*100).toFixed(1)}%`, `ATM ${(atmIV*100).toFixed(1)}%`, `Call ${(avgCallIV*100).toFixed(1)}%`],
+    });
+  }
+
+  // ── 6. IV Rank ────────────────────────────────────────────────────────────
+  if (ivRank) {
+    const ivr = ivRank.iv_rank;
+    const strategy = ivr >= 70
+      ? 'Short Straddle / Iron Condor / Covered Calls'
+      : ivr <= 20
+      ? 'Long Straddle / Long Strangle / Calendar Spread'
+      : 'Neutral spreads — no strong vol edge';
+    signals.push({
+      id: 'iv-rank', time: now,
+      type: ivr >= 70 ? 'alert' : ivr <= 20 ? 'bullish' : 'neutral', category: 'IV REGIME',
+      title: ivr >= 70 ? `IV Rank ${ivr.toFixed(0)} — Sell Volatility` : ivr <= 20 ? `IV Rank ${ivr.toFixed(0)} — Buy Volatility` : `IV Rank ${ivr.toFixed(0)} — Neutral Vol`,
+      body: `Current IV ${ivRank.iv_percent.toFixed(1)}% sits at the ${ivr.toFixed(0)}th percentile of 52-week range (${ivRank.iv_low_52.toFixed(1)}%–${ivRank.iv_high_52.toFixed(1)}%). ${ivr >= 70 ? 'Premium is expensive — time decay works in sellers\' favor.' : ivr <= 20 ? 'Premium cheap historically — buyers have edge before any catalyst.' : 'No strong edge for vol buyers or sellers.'}`,
+      value: `${ivr.toFixed(0)}/100`,
+      tags: [strategy.split(' / ')[0], strategy.split(' / ')[1] ?? ''],
+    });
+  }
+
+  // ── 7. Spot position in OI range ─────────────────────────────────────────
+  const distCe = ceMaxOI.strike - spot;
+  const distPe = spot - peMaxOI.strike;
+  if (distCe > 0 && distPe > 0) {
+    const range = ceMaxOI.strike - peMaxOI.strike;
+    const pct = +((spot - peMaxOI.strike) / range * 100).toFixed(0);
+    signals.push({
+      id: 'spot-range', time: now,
+      type: distCe < distPe ? 'bearish' : pct > 55 ? 'bullish' : 'neutral', category: 'SPOT POSITION',
+      title: `Spot ${pct}% Inside OI Range`,
+      body: `₹${spot.toLocaleString('en-IN')} is ₹${distCe.toFixed(0)} from CE wall (₹${ceMaxOI.strike.toLocaleString('en-IN')}) and ₹${distPe.toFixed(0)} from PE wall (₹${peMaxOI.strike.toLocaleString('en-IN')}). Range width: ₹${range.toFixed(0)}. ${distCe < distPe ? 'Pressing resistance — sellers active above.' : 'Closer to support floor — room to run.'}`,
+      value: `${pct}%`,
+      tags: [`↑ ₹${distCe.toFixed(0)} to resist`, `↓ ₹${distPe.toFixed(0)} to support`],
+    });
+  }
+
+  // ── 8. ATM Straddle + Expected move ──────────────────────────────────────
+  const atmCE = chain.ce.find(l => l.strike === atm);
+  const atmPE = chain.pe.find(l => l.strike === atm);
+  if (atmCE && atmPE) {
+    const sc = atmCE.ltp + atmPE.ltp;
+    const bePct = +((sc / spot) * 100).toFixed(2);
+    const expUp = atm + sc; const expDn = atm - sc;
+    signals.push({
+      id: 'straddle', time: now, type: 'neutral', category: 'EXPECTED MOVE',
+      title: `ATM Straddle ₹${sc.toFixed(0)} — ±${bePct}%`,
+      body: `Market pricing a ±₹${sc.toFixed(0)} (${bePct}%) move by expiry ${chain.expiry}. Breakeven zone: ₹${expDn.toFixed(0)}–₹${expUp.toFixed(0)}. CE ₹${atmCE.ltp.toFixed(1)} + PE ₹${atmPE.ltp.toFixed(1)} = ₹${sc.toFixed(1)}.`,
+      value: `±${bePct}%`,
+      tags: [`Up ₹${expUp.toLocaleString('en-IN')}`, `Down ₹${expDn.toLocaleString('en-IN')}`],
+    });
+  }
+
+  // ── 9. Max Pain estimate ──────────────────────────────────────────────────
+  const allStrikes = [...new Set([...chain.ce.map(l => l.strike), ...chain.pe.map(l => l.strike)])].sort((a, b) => a - b);
+  let maxPainStrike = atm;
+  let minPain = Infinity;
+  for (const s of allStrikes) {
+    const cePain = chain.ce.filter(l => l.strike < s).reduce((t, l) => t + l.oi * Math.max(0, s - l.strike), 0);
+    const pePain = chain.pe.filter(l => l.strike > s).reduce((t, l) => t + l.oi * Math.max(0, l.strike - s), 0);
+    const total = cePain + pePain;
+    if (total < minPain) { minPain = total; maxPainStrike = s; }
+  }
+  const painDist = maxPainStrike - spot;
+  signals.push({
+    id: 'max-pain', time: now,
+    type: painDist > 100 ? 'bullish' : painDist < -100 ? 'bearish' : 'neutral', category: 'MAX PAIN',
+    title: `Max Pain ₹${maxPainStrike.toLocaleString('en-IN')}`,
+    body: `Options max pain (point of maximum loss for buyers) is at ₹${maxPainStrike.toLocaleString('en-IN')}. Spot is ₹${Math.abs(painDist).toFixed(0)} ${painDist > 0 ? 'below' : 'above'} max pain. As expiry nears, price tends to gravitate toward ₹${maxPainStrike.toLocaleString('en-IN')}.`,
+    strike: maxPainStrike,
+    value: `₹${maxPainStrike.toLocaleString('en-IN')}`,
+    tags: [`${painDist > 0 ? '+' : ''}₹${painDist.toFixed(0)} from spot`, `Expiry gravity`],
+  });
+
+  // ── Compute overall bias score ────────────────────────────────────────────
+  const bullCount = signals.filter(s => s.type === 'bullish').length;
+  const bearCount = signals.filter(s => s.type === 'bearish').length;
+  const alertCount = signals.filter(s => s.type === 'alert').length;
+  const rawScore = (bullCount - bearCount) / Math.max(1, bullCount + bearCount + alertCount);
+  const bias: DigestSummary['bias'] = rawScore > 0.15 ? 'bullish' : rawScore < -0.15 ? 'bearish' : 'neutral';
+
+  return {
+    signals,
+    summary: { bias, score: Math.round(rawScore * 100), bullCount, bearCount },
+  };
+}
+
+type DigestTab = 'all' | 'signals';
+
+function AIDigest({
+  chain, ivRank, spot, visible, onClose,
+}: {
+  chain: OptionChainData | null;
+  ivRank: IVRankData | null;
+  spot: number;
+  visible: boolean;
+  onClose: () => void;
+}) {
+  const [signals, setSignals]       = useState<DigestSignal[]>([]);
+  const [summary, setSummary]       = useState<DigestSummary | null>(null);
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [tab, setTab]               = useState<DigestTab>('all');
+  const [flash, setFlash]           = useState(false);
+  const [countdown, setCountdown]   = useState(30);
+  const timerRef                    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cdRef                       = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const refresh = useCallback(() => {
+    if (!chain) return;
+    const { signals: next, summary: sum } = buildDigest(chain, ivRank, spot);
+    setSignals(next);
+    setSummary(sum);
+    setLastUpdate(new Date());
+    setFlash(true);
+    setCountdown(30);
+    setTimeout(() => setFlash(false), 800);
+  }, [chain, ivRank, spot]);
+
+  useEffect(() => { refresh(); }, [chain, ivRank]);
+
+  useEffect(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (cdRef.current) clearInterval(cdRef.current);
+    timerRef.current = setInterval(refresh, 30_000);
+    cdRef.current    = setInterval(() => setCountdown(c => Math.max(0, c - 1)), 1_000);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (cdRef.current) clearInterval(cdRef.current);
+    };
+  }, [refresh]);
+
+  const C = (t: DigestSignal['type']) =>
+    t === 'bullish' ? '#4ade80' : t === 'bearish' ? '#f87171' : t === 'alert' ? '#fbbf24' : '#64748b';
+  const BG = (t: DigestSignal['type']) =>
+    t === 'bullish' ? 'rgba(74,222,128,0.07)' : t === 'bearish' ? 'rgba(248,113,113,0.07)' : t === 'alert' ? 'rgba(251,191,36,0.07)' : 'rgba(255,255,255,0.02)';
+  const LABEL = (t: DigestSignal['type']) =>
+    t === 'bullish' ? '▲ BULL' : t === 'bearish' ? '▼ BEAR' : t === 'alert' ? '⚡ ALERT' : '● NEUTRAL';
+
+  const filtered = tab === 'signals'
+    ? signals.filter(s => s.type !== 'neutral')
+    : signals;
+
+  const biasColor = summary?.bias === 'bullish' ? '#4ade80' : summary?.bias === 'bearish' ? '#f87171' : '#94a3b8';
+
+  return (
+    // Absolute drawer — zero impact on charts layout width at all times.
+    // translateX is pure compositor work (no layout, no paint).
+    <div style={{
+      position: 'absolute', top: 0, right: 0, bottom: 0,
+      width: 308, zIndex: 20,
+      transform: visible ? 'translateX(0)' : 'translateX(100%)',
+      transition: 'transform 0.26s cubic-bezier(0.4,0,0.2,1)',
+      background: '#070c12',
+      borderLeft: '1px solid rgba(255,255,255,0.09)',
+      display: 'flex', flexDirection: 'column',
+      willChange: 'transform',
+      fontFamily: "'Inter', system-ui, sans-serif",
+      pointerEvents: visible ? 'auto' : 'none',
+    }}>
+
+        {/* ── Header ── */}
+        <div style={{
+          padding: '11px 14px 9px',
+          borderBottom: '1px solid rgba(255,255,255,0.07)',
+          background: '#060a0f', flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{
+              width: 7, height: 7, borderRadius: '50%',
+              background: chain ? '#4ade80' : '#334155',
+              boxShadow: chain ? '0 0 0 3px rgba(74,222,128,0.22)' : 'none',
+              animation: chain ? 'pulse 2.4s ease-in-out infinite' : 'none',
+              flexShrink: 0,
+            }} />
+            <span style={{ fontSize: 12, fontWeight: 700, color: '#f1f5f9', letterSpacing: '-0.02em' }}>AI Digest</span>
+            {flash && (
+              <span style={{
+                fontSize: 8, fontWeight: 700, color: '#4ade80', letterSpacing: '0.1em',
+                padding: '1px 5px', borderRadius: 3,
+                background: 'rgba(74,222,128,0.12)',
+                border: '1px solid rgba(74,222,128,0.25)',
+                animation: 'fadeIn 0.2s ease',
+              }}>UPDATED</span>
+            )}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            {lastUpdate && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2, textAlign: 'right' }}>
+                <div style={{ fontSize: 11, color: '#e2e8f0', fontFamily: "'JetBrains Mono',monospace", letterSpacing: '0.03em', lineHeight: 1, fontWeight: 500 }}>
+                  {lastUpdate.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </div>
+                <div style={{ fontSize: 9, color: '#64748b', letterSpacing: '0.04em', fontWeight: 500 }}>
+                  refresh in {countdown}s
+                </div>
+              </div>
+            )}
+            <button onClick={onClose} style={{
+              color: '#475569', fontSize: 16, lineHeight: 1,
+              padding: '3px 6px', borderRadius: 5,
+              background: 'rgba(255,255,255,0.04)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              transition: 'color 0.15s, background 0.15s',
+            }}>×</button>
+          </div>
+        </div>
+
+        {/* ── Bias Summary Bar ── */}
+        {summary && chain && (
+          <div style={{
+            padding: '10px 14px',
+            borderBottom: '1px solid rgba(255,255,255,0.06)',
+            background: '#060a0f', flexShrink: 0,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 7 }}>
+              <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.1em', color: '#94a3b8', textTransform: 'uppercase' }}>Market Bias</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: biasColor, letterSpacing: '-0.01em' }}>
+                {summary.bias === 'bullish' ? '▲ BULLISH' : summary.bias === 'bearish' ? '▼ BEARISH' : '● NEUTRAL'}
+              </span>
+            </div>
+            {/* Bull/Bear bar */}
+            <div style={{ height: 5, borderRadius: 999, background: 'rgba(255,255,255,0.06)', overflow: 'hidden', position: 'relative' }}>
+              <div style={{
+                position: 'absolute', left: 0, top: 0, bottom: 0,
+                width: `${(summary.bullCount / Math.max(1, summary.bullCount + summary.bearCount)) * 100}%`,
+                background: 'linear-gradient(90deg,#4ade80,#22c55e)',
+                borderRadius: 999,
+                transition: 'width 0.5s ease',
+              }} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
+              <span style={{ fontSize: 9, color: '#4ade80', fontWeight: 600 }}>▲ {summary.bullCount} Bullish</span>
+              <span style={{ fontSize: 9, color: '#f87171', fontWeight: 600 }}>{summary.bearCount} Bearish ▼</span>
+            </div>
+            {/* Quick stat row */}
+            <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+              {[
+                { label: 'PCR', val: chain.pcr.toFixed(2), color: chain.pcr > 1.2 ? '#4ade80' : chain.pcr < 0.8 ? '#f87171' : '#94a3b8' },
+                { label: 'ATM', val: `₹${chain.atm.toLocaleString('en-IN')}`, color: '#7dd3fc' },
+                { label: 'IV', val: ivRank ? `${ivRank.iv_percent.toFixed(1)}%` : '—', color: '#fbbf24' },
+              ].map(({ label, val, color }) => (
+                <div key={label} style={{
+                  flex: 1, padding: '5px 7px',
+                  background: 'rgba(255,255,255,0.03)',
+                  border: '1px solid rgba(255,255,255,0.07)',
+                  borderRadius: 5, textAlign: 'center',
+                }}>
+                  <div style={{ fontSize: 9, color: '#94a3b8', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>{label}</div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color, marginTop: 2, letterSpacing: '-0.01em', fontFamily: "'JetBrains Mono',monospace" }}>{val}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Tabs ── */}
+        <div style={{
+          display: 'flex', background: '#060a0f',
+          borderBottom: '1px solid rgba(255,255,255,0.07)', flexShrink: 0,
+        }}>
+          {(['all', 'signals'] as DigestTab[]).map(t => (
+            <button key={t} onClick={() => setTab(t)} style={{
+              flex: 1, padding: '8px 0', fontSize: 10, fontWeight: 700,
+              letterSpacing: '0.07em', textTransform: 'uppercase',
+              color: tab === t ? '#f1f5f9' : '#475569',
+              borderBottom: tab === t ? '2px solid #7dd3fc' : '2px solid transparent',
+              background: 'none',
+              transition: 'color 0.15s ease, border-color 0.15s ease',
+            }}>
+              {t === 'all' ? `All · ${signals.length}` : `Signals · ${signals.filter(s => s.type !== 'neutral').length}`}
+            </button>
+          ))}
+        </div>
+
+        {/* ── Signal list ── */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0 4px' }}>
+          {!chain ? (
+            <div style={{ padding: '32px 20px', textAlign: 'center' }}>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>🧠</div>
+              <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.7, fontWeight: 500 }}>
+                Load option chain data<br />to activate the AI digest.
+              </div>
+            </div>
+          ) : filtered.map((sig) => (
+            <div key={sig.id} style={{
+              margin: '0 8px 7px',
+              background: BG(sig.type),
+              border: `1px solid ${C(sig.type)}1a`,
+              borderLeft: `3px solid ${C(sig.type)}`,
+              borderRadius: '0 7px 7px 0',
+              padding: '10px 12px',
+              transition: 'background 0.2s ease',
+            }}>
+              {/* Top row: category + time + value */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: '0.1em', color: C(sig.type) }}>
+                    {LABEL(sig.type)}
+                  </span>
+                  <span style={{ fontSize: 9, fontWeight: 600, letterSpacing: '0.07em', color: '#64748b', textTransform: 'uppercase' }}>
+                    {sig.category}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {sig.value && (
+                    <span style={{
+                      fontSize: 11, fontWeight: 700, color: C(sig.type),
+                      fontFamily: "'JetBrains Mono',monospace", letterSpacing: '-0.01em',
+                    }}>{sig.value}</span>
+                  )}
+                  <span style={{
+                    fontSize: 10, color: '#94a3b8',
+                    fontFamily: "'JetBrains Mono',monospace", letterSpacing: '0.02em', fontWeight: 500,
+                  }}>{sig.time}</span>
+                </div>
+              </div>
+
+              {/* Title */}
+              <div style={{ fontSize: 11.5, fontWeight: 700, color: '#f1f5f9', marginBottom: 5, letterSpacing: '-0.015em', lineHeight: 1.3 }}>
+                {sig.title}
+              </div>
+
+              {/* Body */}
+              <div style={{ fontSize: 11, color: '#cbd5e1', lineHeight: 1.65, fontWeight: 400, marginBottom: sig.bars || sig.tags ? 8 : 0 }}>
+                {sig.body}
+              </div>
+
+              {/* Mini bar chart */}
+              {sig.bars && sig.bars.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: sig.tags ? 7 : 0 }}>
+                  {sig.bars.map(b => (
+                    <div key={b.label} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span style={{ fontSize: 9, color: '#94a3b8', width: 64, flexShrink: 0, letterSpacing: '0.02em', fontFamily: "'JetBrains Mono',monospace", fontWeight: 500 }}>{b.label}</span>
+                      <div style={{ flex: 1, height: 4, borderRadius: 999, background: 'rgba(255,255,255,0.05)', overflow: 'hidden' }}>
+                        <div style={{
+                          height: '100%', borderRadius: 999,
+                          width: `${Math.min(100, (b.val / b.max) * 100)}%`,
+                          background: b.color,
+                          opacity: 0.85,
+                          transition: 'width 0.4s ease',
+                        }} />
+                      </div>
+                      <span style={{ fontSize: 10, color: b.color, fontFamily: "'JetBrains Mono',monospace", letterSpacing: '-0.01em', width: 36, textAlign: 'right', flexShrink: 0, fontWeight: 600 }}>
+                        {b.val.toFixed(1)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Tags row */}
+              {sig.tags && sig.tags.filter(Boolean).length > 0 && (
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {sig.tags.filter(Boolean).map(tag => (
+                    <span key={tag} style={{
+                      display: 'inline-flex', alignItems: 'center',
+                      padding: '2px 7px', borderRadius: 4,
+                      background: `${C(sig.type)}10`,
+                      border: `1px solid ${C(sig.type)}25`,
+                      fontSize: 9, fontWeight: 600, color: C(sig.type),
+                      letterSpacing: '0.03em',
+                    }}>{tag}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+
+          {/* Footer */}
+          {chain && (
+            <div style={{
+              margin: '4px 8px 8px',
+              padding: '8px 12px',
+              borderRadius: 6,
+              background: 'rgba(255,255,255,0.02)',
+              border: '1px solid rgba(255,255,255,0.05)',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            }}>
+              <span style={{ fontSize: 9.5, color: '#64748b', letterSpacing: '0.05em', textTransform: 'uppercase', fontWeight: 500 }}>
+                Refresh in {countdown}s
+              </span>
+              <div style={{
+                height: 3, width: 60, borderRadius: 999,
+                background: 'rgba(255,255,255,0.06)', overflow: 'hidden',
+              }}>
+                <div style={{
+                  height: '100%', borderRadius: 999,
+                  width: `${(countdown / 30) * 100}%`,
+                  background: '#7dd3fc',
+                  transition: 'width 1s linear',
+                }} />
+              </div>
+            </div>
+          )}
+        </div>
+    </div>
+  );
+}
+
 // IV Rank radial gauge
 function IVRankGauge({ rank, ivPct, high, low }: { rank: number; ivPct: number; high: number; low: number }) {
   const clamped = Math.min(100, Math.max(0, rank));
@@ -591,6 +1110,7 @@ function OptionsDesk({
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
   const [strikes, setStrikes] = useState(10);
+  const [digestVisible, setDigestVisible] = useState(true);
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [indexStreamStatus, setIndexStreamStatus] = useState('idle');
   const [optionStreamStatus, setOptionStreamStatus] = useState('idle');
@@ -1011,6 +1531,18 @@ function OptionsDesk({
           style={{ padding: '6px 16px', fontSize: 12, fontFamily: "'Inter', sans-serif", fontWeight: 600 }}>
           {loading ? 'Loading…' : chain ? '↻ Refresh' : 'Load Data'}
         </button>
+        <button
+          onClick={() => setDigestVisible(v => !v)}
+          style={{
+            padding: '6px 12px', fontSize: 11, fontWeight: 600,
+            fontFamily: "'Inter', sans-serif", borderRadius: 8,
+            background: digestVisible ? 'rgba(125,211,252,0.12)' : 'rgba(255,255,255,0.04)',
+            border: `1px solid ${digestVisible ? 'rgba(125,211,252,0.3)' : 'rgba(255,255,255,0.1)'}`,
+            color: digestVisible ? '#7dd3fc' : '#64748b',
+            letterSpacing: '0.04em', cursor: 'pointer',
+            transition: 'all 0.15s ease',
+          }}
+        >🧠 AI Digest</button>
         <span className="pill-v2" title="Rust index stream status">IDX {indexStreamStatus}</span>
         <span className="pill-v2" title="Option-chain packet status. This is not the same as OI changing.">OPT packet {optionStreamStatus}</span>
         <span className="pill-v2" title="OI changes only when the exchange/feed sends a new OI value.">OI {oiUpdateStatus}</span>
@@ -1033,8 +1565,10 @@ function OptionsDesk({
         )}
       </div>
 
-      {/* ── BODY ── */}
-      <div className="options-body" style={{ overflow: 'auto', height: 'calc(100dvh - 110px)', padding: '10px 14px 14px', display: 'grid', gap: 8, alignContent: 'start', background: '#080d14' }}>
+      {/* ── BODY + DIGEST SIDE PANEL ── */}
+      {/* Body — position:relative so digest drawer is absolute inside it */}
+      <div style={{ position: 'relative', height: 'calc(100dvh - 110px)', overflow: 'hidden', background: '#080d14', display: 'flex' }}>
+      <div className="options-body" style={{ flex: 1, overflow: 'auto', padding: '10px 14px 14px', display: 'grid', gap: 8, alignContent: 'start', minWidth: 0 }}>
 
         {err && <div className="err-banner">{err}</div>}
         {session?.is_demo && <div className="msg-banner">Demo mode — log in with a real Nubra account to load live option chain data.</div>}
@@ -1296,7 +1830,16 @@ function OptionsDesk({
             Select an <strong>underlying</strong> and <strong>expiry</strong>, then click <strong>Load Data</strong> to fetch the live option chain.
           </div>
         )}
-      </div>
+      </div>{/* end options-body */}
+
+      <AIDigest
+        chain={chain}
+        ivRank={ivRank}
+        spot={livePrice ?? chain?.current_price ?? 0}
+        visible={digestVisible}
+        onClose={() => setDigestVisible(false)}
+      />
+      </div>{/* end body+digest wrapper */}
     </div>
   );
 }
