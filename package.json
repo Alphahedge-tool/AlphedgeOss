@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 8888",
     "server:go": "cd go-backend && go run .",
+    "realtime:rust": "cd rust-realtime && cargo run",
     "dev:all": "concurrently \"npm run dev\" \"npm run server:go\"",
+    "dev:all:rust": "concurrently \"npm run dev\" \"npm run server:go\" \"npm run realtime:rust\"",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 8888"
   },

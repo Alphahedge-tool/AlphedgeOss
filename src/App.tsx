@@ -592,7 +592,15 @@ function OptionsDesk({
   const [err, setErr] = useState('');
   const [strikes, setStrikes] = useState(10);
   const [livePrice, setLivePrice] = useState<number | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const [indexStreamStatus, setIndexStreamStatus] = useState('idle');
+  const [optionStreamStatus, setOptionStreamStatus] = useState('idle');
+  const [oiUpdateStatus, setOiUpdateStatus] = useState('waiting');
+  const [volumeUpdateStatus, setVolumeUpdateStatus] = useState('waiting');
+  // Stable OI snapshot — only updated when OI values actually change (~every 3 min).
+  // Keeps OI charts from re-animating on every LTP tick.
+  const [oiSnap, setOiSnap] = useState<{ ce: OptionLeg[]; pe: OptionLeg[]; total_ce_oi: number; total_pe_oi: number; pcr: number } | null>(null);
+  const indexWsRef = useRef<WebSocket | null>(null);
+  const optionWsRef = useRef<WebSocket | null>(null);
   const ACCENT = 'rgb(120,201,255)';
   const NEG    = 'rgb(241,66,66)';
   const POS    = 'rgb(124,207,94)';
@@ -632,6 +640,13 @@ function OptionsDesk({
       const ivData: IVRankData         = await ivRes.json();
       setChain(chainData);
       setIVRank(ivData);
+      // Seed the stable OI snapshot from the initial REST fetch.
+      setOiSnap({
+        ce: chainData.ce, pe: chainData.pe,
+        total_ce_oi: chainData.total_ce_oi,
+        total_pe_oi: chainData.total_pe_oi,
+        pcr: chainData.pcr,
+      });
       // auto-select first expiry returned
       if (!expiry && chainData.all_expiries?.length) setExpiry(chainData.all_expiries[0]);
     } catch (e) {
@@ -641,40 +656,247 @@ function OptionsDesk({
     }
   }, [session, body, headers, expiry]);
 
-  // Connect Nubra WebSocket for live index price
-  useEffect(() => {
-    if (!session || session.is_demo) return;
-    const base = session.environment === 'UAT' ? 'wss://uatapi.nubra.io/apibatch/ws' : 'wss://api.nubra.io/apibatch/ws';
-    const ws = new WebSocket(base);
-    wsRef.current = ws;
-    ws.onopen = () => {
-      ws.send(`batch_subscribe ${session.access_token} index {"indexes":["${instrument}"]} NSE`);
+  const normalizeExpiry = (value: string) => {
+    const digitsOnly = value.replace(/\D/g, '');
+    return digitsOnly.length === 8 ? digitsOnly : value;
+  };
+
+  const liveLeg = (item: Record<string, unknown>): OptionLeg => {
+    const num = (key: string) => typeof item[key] === 'number' ? item[key] as number : 0;
+    const int = (key: string) => Math.trunc(num(key));
+    return {
+      ref_id: int('ref_id') || int('inst_id'),
+      strike: num('sp') / 100,
+      ltp: num('ltp') / 100,
+      ltp_chg: num('ltpchg'),
+      iv: num('iv'),
+      delta: num('delta'),
+      gamma: num('gamma'),
+      theta: num('theta'),
+      vega: num('vega'),
+      oi: int('oi'),
+      oi_chg: int('prev_oi') ? int('oi') - int('prev_oi') : 0,
+      volume: int('volume'),
     };
+  };
+
+  // WebSocket tick handler — LTP / IV / Greeks ONLY. OI comes from REST poll below.
+  const applyLiveOptionUpdate = useCallback((payload: Record<string, unknown>) => {
+    const ce = Array.isArray(payload.ce) ? payload.ce.map(x => liveLeg(x as Record<string, unknown>)) : [];
+    const pe = Array.isArray(payload.pe) ? payload.pe.map(x => liveLeg(x as Record<string, unknown>)) : [];
+    if (!ce.length && !pe.length) return;
+
+    const currentPrice = typeof payload.currentprice === 'number' ? payload.currentprice / 100 : undefined;
+    const atm = typeof payload.atm === 'number' ? payload.atm / 100 : undefined;
+
+    setChain(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        instrument: typeof payload.asset === 'string' ? payload.asset : prev.instrument,
+        expiry: typeof payload.expiry === 'string' ? payload.expiry : prev.expiry,
+        current_price: currentPrice ?? prev.current_price,
+        atm: atm ?? prev.atm,
+        // Keep OI/volume from existing state — they come from REST poll, not WebSocket.
+        ce: ce.length ? ce.map(live => {
+          const existing = prev.ce.find(l => l.ref_id === live.ref_id);
+          return { ...live, oi: existing?.oi ?? 0, oi_chg: existing?.oi_chg ?? 0, volume: existing?.volume ?? 0 };
+        }) : prev.ce,
+        pe: pe.length ? pe.map(live => {
+          const existing = prev.pe.find(l => l.ref_id === live.ref_id);
+          return { ...live, oi: existing?.oi ?? 0, oi_chg: existing?.oi_chg ?? 0, volume: existing?.volume ?? 0 };
+        }) : prev.pe,
+      };
+    });
+
+    if (currentPrice) setLivePrice(currentPrice);
+  }, []);
+
+  const activeExpiry = expiry || chain?.expiry || chain?.all_expiries?.[0] || '';
+
+  // REST OI poll — calls Rust /oi/snapshot which hits Nubra option chain REST API.
+  // NSE updates OI every ~3 minutes; we poll at the same cadence.
+  const pollOiSnapshot = useCallback(async () => {
+    if (!session || session.is_demo || !activeExpiry) return;
+    const params = new URLSearchParams({
+      token: session.access_token,
+      env: session.environment,
+      instrument,
+      exchange: 'NSE',
+      expiry: activeExpiry,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:3003/oi/snapshot?${params.toString()}`);
+      if (!res.ok) return;
+      const data = await res.json() as {
+        ce: { ref_id: number; strike: number; oi: number; volume: number }[];
+        pe: { ref_id: number; strike: number; oi: number; volume: number }[];
+        total_ce_oi: number; total_pe_oi: number; pcr: number;
+        atm: number; current_price: number; fetched_at_ms: number;
+      };
+
+      // Map REST legs to OptionLeg shape, preserving IV/Greeks from the live chain state.
+      setChain(prev => {
+        if (!prev) return prev;
+        const mergeLeg = (
+          restLeg: { ref_id: number; strike: number; oi: number; volume: number },
+          prevLegs: OptionLeg[],
+        ): OptionLeg => {
+          const existing = prevLegs.find(l => l.ref_id === restLeg.ref_id);
+          return {
+            ref_id: restLeg.ref_id,
+            strike: restLeg.strike,
+            ltp:    existing?.ltp    ?? 0,
+            ltp_chg: existing?.ltp_chg ?? 0,
+            iv:     existing?.iv     ?? 0,
+            delta:  existing?.delta  ?? 0,
+            gamma:  existing?.gamma  ?? 0,
+            theta:  existing?.theta  ?? 0,
+            vega:   existing?.vega   ?? 0,
+            oi:     restLeg.oi,
+            oi_chg: restLeg.oi - (existing?.oi ?? restLeg.oi),
+            volume: restLeg.volume,
+          };
+        };
+        return {
+          ...prev,
+          ce: data.ce.map(l => mergeLeg(l, prev.ce)),
+          pe: data.pe.map(l => mergeLeg(l, prev.pe)),
+          total_ce_oi: data.total_ce_oi,
+          total_pe_oi: data.total_pe_oi,
+          pcr: data.pcr,
+        };
+      });
+
+      // Also update oiSnap so the charts refresh from clean REST data.
+      setOiSnap(prev => {
+        const now = new Date().toLocaleTimeString();
+        const prevKey = (prev?.ce ?? []).map(l => `${l.ref_id}:${l.oi}`).join('|');
+        const nextKey = data.ce.map(l => `${l.ref_id}:${l.oi}`).join('|');
+        if (nextKey !== prevKey) setOiUpdateStatus(`REST ${now}`);
+        const prevVolKey = (prev?.pe ?? []).map(l => `${l.ref_id}:${l.volume}`).join('|');
+        const nextVolKey = data.pe.map(l => `${l.ref_id}:${l.volume}`).join('|');
+        if (nextVolKey !== prevVolKey) setVolumeUpdateStatus(`REST ${now}`);
+        return {
+          ce: data.ce.map(l => ({
+            ref_id: l.ref_id, strike: l.strike, oi: l.oi, volume: l.volume,
+            ltp: 0, ltp_chg: 0, iv: 0, delta: 0, gamma: 0, theta: 0, vega: 0,
+            oi_chg: 0,
+          })),
+          pe: data.pe.map(l => ({
+            ref_id: l.ref_id, strike: l.strike, oi: l.oi, volume: l.volume,
+            ltp: 0, ltp_chg: 0, iv: 0, delta: 0, gamma: 0, theta: 0, vega: 0,
+            oi_chg: 0,
+          })),
+          total_ce_oi: data.total_ce_oi,
+          total_pe_oi: data.total_pe_oi,
+          pcr: data.pcr,
+        };
+      });
+    } catch { /* network error — silently skip, will retry next interval */ }
+  }, [session, instrument, activeExpiry]);
+
+  // Connect Rust realtime bridge for live index price
+  useEffect(() => {
+    if (!session || session.is_demo) {
+      setIndexStreamStatus('idle');
+      return;
+    }
+    const params = new URLSearchParams({
+      token: session.access_token,
+      env: session.environment,
+      instrument,
+      exchange: 'NSE',
+    });
+    setIndexStreamStatus('connecting');
+    const ws = new WebSocket(`ws://127.0.0.1:3003/ws/realtime?${params.toString()}`);
+    indexWsRef.current = ws;
+    ws.onopen = () => setIndexStreamStatus('connected');
     ws.onmessage = (ev) => {
-      // Nubra sends protobuf binary — we decode the JSON fallback via index_value field
-      // For text frames (post-market / debug), parse directly
       if (typeof ev.data === 'string') {
         try {
           const d = JSON.parse(ev.data);
-          if (d.index_value) setLivePrice(d.index_value / 100);
+          if (d.type === 'connected') setIndexStreamStatus('subscribed');
+          if (d.type === 'index') setIndexStreamStatus(`price tick ${new Date().toLocaleTimeString()}`);
+          if (d.type === 'nubra_text' && typeof d.payload?.raw === 'string' && /invalid token/i.test(d.payload.raw)) {
+            setErr('Rust realtime stream rejected the session token. Please sign in again.');
+            setIndexStreamStatus('invalid token');
+          }
+          const payload = d.payload ?? d;
+          const firstTick = payload.indexes?.[0] ?? payload.instruments?.[0] ?? payload;
+          const indexValue = firstTick.index_value ?? firstTick.indexValue;
+          if (typeof indexValue === 'number') setLivePrice(indexValue / 100);
         } catch { /* ignore */ }
       }
-      // Binary protobuf frames are decoded by the browser as ArrayBuffer;
-      // without the proto schema in the browser we can't decode them here —
-      // live price from REST snapshot is used as fallback.
     };
-    ws.onerror = () => {};
-    return () => { ws.close(); };
+    ws.onerror = () => setIndexStreamStatus('error');
+    ws.onclose = () => setIndexStreamStatus('closed');
+    return () => { ws.close(); setIndexStreamStatus('closed'); };
   }, [session, instrument]);
+
+  // Connect Rust realtime bridge for live option-chain OI/IV/Greeks ticks.
+  useEffect(() => {
+    if (!session || session.is_demo || !activeExpiry) {
+      setOptionStreamStatus('idle');
+      return;
+    }
+    const params = new URLSearchParams({
+      token: session.access_token,
+      env: session.environment,
+      instrument,
+      exchange: 'NSE',
+      stream: 'option',
+      expiry: normalizeExpiry(activeExpiry),
+    });
+    setOptionStreamStatus('connecting');
+    const ws = new WebSocket(`ws://127.0.0.1:3003/ws/realtime?${params.toString()}`);
+    optionWsRef.current = ws;
+    ws.onopen = () => setOptionStreamStatus('connected');
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return;
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === 'connected') setOptionStreamStatus('subscribed');
+        if (d.type === 'nubra_text' && typeof d.payload?.raw === 'string' && /invalid token/i.test(d.payload.raw)) {
+          setErr('Rust option stream rejected the session token. Please sign in again.');
+          setOptionStreamStatus('invalid token');
+          return;
+        }
+        if (d.type === 'decode_error') {
+          console.warn('Option stream decode error', d);
+          setOptionStreamStatus('decode error');
+          return;
+        }
+        if (d.type === 'option' && d.payload) {
+          setOptionStreamStatus(`packet ${new Date().toLocaleTimeString()}`);
+          applyLiveOptionUpdate(d.payload as Record<string, unknown>);
+        }
+      } catch { /* ignore */ }
+    };
+    ws.onerror = () => setOptionStreamStatus('error');
+    ws.onclose = () => setOptionStreamStatus('closed');
+    return () => { ws.close(); setOptionStreamStatus('closed'); };
+  }, [session, instrument, activeExpiry, applyLiveOptionUpdate]);
+
+  // Poll Rust /oi/snapshot (Nubra REST) every 3 minutes for authoritative OI.
+  // WebSocket carries LTP/IV/Greeks only — OI never comes from WebSocket ticks.
+  useEffect(() => {
+    if (!session || session.is_demo || !activeExpiry) return;
+    pollOiSnapshot(); // immediate on mount / expiry change
+    const id = setInterval(pollOiSnapshot, 3 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [session, instrument, activeExpiry, pollOiSnapshot]);
 
   // Derive chart data from chain
   const atmStrike = chain?.atm ?? 0;
 
   const oiData = useMemo(() => {
-    if (!chain) return [];
-    const ceMap = new Map(chain.ce.map(l => [l.strike, l]));
-    const peMap = new Map(chain.pe.map(l => [l.strike, l]));
-    const allStrikes = [...new Set([...chain.ce.map(l => l.strike), ...chain.pe.map(l => l.strike)])].sort((a, b) => a - b);
+    // Use oiSnap (stable, ~3-min cadence) not chain (every LTP tick).
+    const src = oiSnap ?? chain;
+    if (!src) return [];
+    const ceMap = new Map(src.ce.map(l => [l.strike, l]));
+    const peMap = new Map(src.pe.map(l => [l.strike, l]));
+    const allStrikes = [...new Set([...src.ce.map(l => l.strike), ...src.pe.map(l => l.strike)])].sort((a, b) => a - b);
     const atmIdx = allStrikes.findIndex(s => s >= atmStrike);
     const lo = Math.max(0, atmIdx - strikes);
     const hi = Math.min(allStrikes.length, atmIdx + strikes + 1);
@@ -682,6 +904,8 @@ function OptionsDesk({
       strike: s,
       ceOI: (ceMap.get(s)?.oi ?? 0) / 1e5,
       peOI: (peMap.get(s)?.oi ?? 0) / 1e5,
+      ceVol: ceMap.get(s)?.volume ?? 0,
+      peVol: peMap.get(s)?.volume ?? 0,
       isATM: s === atmStrike,
     }));
   }, [chain, atmStrike, strikes]);
@@ -717,6 +941,14 @@ function OptionsDesk({
   }, [chain, atmStrike]);
 
   const fmtK = (n: number) => n >= 100 ? `${n.toFixed(1)}L` : n >= 1 ? `${n.toFixed(2)}L` : `${(n * 1e5).toFixed(0)}`;
+  const fmtQty = (n: number) =>
+    n >= 1e7 ? `${(n / 1e7).toFixed(2)}Cr` :
+    n >= 1e5 ? `${(n / 1e5).toFixed(2)}L` :
+    n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` :
+    n > 0 ? n.toLocaleString('en-IN') : '—';
+  // Volume and OI totals come from oiSnap, not chain, so they don't flicker on every LTP tick.
+  const totalCEVolume = (oiSnap ?? chain)?.ce.reduce((sum, leg) => sum + leg.volume, 0) ?? 0;
+  const totalPEVolume = (oiSnap ?? chain)?.pe.reduce((sum, leg) => sum + leg.volume, 0) ?? 0;
 
   const tickStyle = { fill: 'var(--fg-faint)', fontSize: 9, fontFamily: 'JetBrains Mono, monospace' };
 
@@ -740,11 +972,11 @@ function OptionsDesk({
   const TTL  = { fontSize: 13.5, fontWeight: 700, color: '#f1f5f9', letterSpacing: '-0.015em', marginBottom: 10, fontFamily: "'Inter', sans-serif" } as React.CSSProperties;
 
   return (
-    <div className="dash" data-theme={theme}>
+    <div className="dash options-desk" data-theme={theme}>
       {renderNav('options')}
 
       {/* ── TOOLBAR ── */}
-      <div style={{
+      <div className="options-toolbar" style={{
         display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
         padding: '0 18px', borderBottom: '1px solid rgba(255,255,255,0.07)',
         background: '#060a0f', position: 'sticky', top: 64, zIndex: 5, minHeight: 48,
@@ -779,6 +1011,10 @@ function OptionsDesk({
           style={{ padding: '6px 16px', fontSize: 12, fontFamily: "'Inter', sans-serif", fontWeight: 600 }}>
           {loading ? 'Loading…' : chain ? '↻ Refresh' : 'Load Data'}
         </button>
+        <span className="pill-v2" title="Rust index stream status">IDX {indexStreamStatus}</span>
+        <span className="pill-v2" title="Option-chain packet status. This is not the same as OI changing.">OPT packet {optionStreamStatus}</span>
+        <span className="pill-v2" title="OI changes only when the exchange/feed sends a new OI value.">OI {oiUpdateStatus}</span>
+        <span className="pill-v2" title="Volume changes when the option-chain stream sends a new volume value.">VOL {volumeUpdateStatus}</span>
 
         {chain && (
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 22 }}>
@@ -798,7 +1034,7 @@ function OptionsDesk({
       </div>
 
       {/* ── BODY ── */}
-      <div style={{ overflow: 'auto', height: 'calc(100dvh - 110px)', padding: '10px 14px 14px', display: 'grid', gap: 8, alignContent: 'start', background: '#080d14' }}>
+      <div className="options-body" style={{ overflow: 'auto', height: 'calc(100dvh - 110px)', padding: '10px 14px 14px', display: 'grid', gap: 8, alignContent: 'start', background: '#080d14' }}>
 
         {err && <div className="err-banner">{err}</div>}
         {session?.is_demo && <div className="msg-banner">Demo mode — log in with a real Nubra account to load live option chain data.</div>}
@@ -806,13 +1042,15 @@ function OptionsDesk({
         {chain && <>
 
           {/* ── METRIC STRIP ── 8 tiles */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: 6 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(10, minmax(0, 1fr))', gap: 6 }}>
             {[
-              { label: 'Total CE OI',  value: `${(chain.total_ce_oi/1e5).toFixed(2)}L`, color: '#4ade80', accent: '#4ade8022' },
-              { label: 'Total PE OI',  value: `${(chain.total_pe_oi/1e5).toFixed(2)}L`, color: '#f87171', accent: '#f8717122' },
-              { label: 'Put-Call Ratio', value: chain.pcr.toFixed(3),
-                color: chain.pcr > 1.2 ? '#4ade80' : chain.pcr < 0.8 ? '#f87171' : '#fbbf24',
-                accent: chain.pcr > 1.2 ? '#4ade8018' : chain.pcr < 0.8 ? '#f8717118' : '#fbbf2418' },
+              { label: 'Total CE OI',  value: `${((oiSnap ?? chain).total_ce_oi/1e5).toFixed(2)}L`, color: '#4ade80', accent: '#4ade8022' },
+              { label: 'Total PE OI',  value: `${((oiSnap ?? chain).total_pe_oi/1e5).toFixed(2)}L`, color: '#f87171', accent: '#f8717122' },
+              { label: 'CE Volume',     value: fmtQty(totalCEVolume), color: '#86efac', accent: '#4ade8012' },
+              { label: 'PE Volume',     value: fmtQty(totalPEVolume), color: '#fca5a5', accent: '#f8717112' },
+              { label: 'Put-Call Ratio', value: (oiSnap ?? chain).pcr.toFixed(3),
+                color: (oiSnap ?? chain).pcr > 1.2 ? '#4ade80' : (oiSnap ?? chain).pcr < 0.8 ? '#f87171' : '#fbbf24',
+                accent: (oiSnap ?? chain).pcr > 1.2 ? '#4ade8018' : (oiSnap ?? chain).pcr < 0.8 ? '#f8717118' : '#fbbf2418' },
               { label: 'ATM Strike',    value: `₹${chain.atm.toLocaleString('en-IN')}`, color: '#7dd3fc', accent: '#7dd3fc18' },
               { label: 'Spot Price',    value: `₹${(livePrice ?? chain.current_price).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`, color: '#e2e8f0', accent: '#ffffff0a' },
               { label: 'IV Rank',       value: ivRank ? `${ivRank.iv_rank.toFixed(0)} / 100` : '—',
@@ -821,7 +1059,7 @@ function OptionsDesk({
               { label: 'ATM IV',        value: ivRank ? `${ivRank.iv_percent.toFixed(1)}%` : '—', color: '#94a3b8', accent: '#ffffff0a' },
               { label: 'Expiry',        value: chain.expiry ?? '—', color: '#94a3b8', accent: '#ffffff0a' },
             ].map(({ label, value, color, accent }) => (
-              <div key={label} style={{ background: accent, border: '1px solid rgba(255,255,255,0.07)', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <div key={label} className="options-metric-tile" style={{ background: accent, border: '1px solid rgba(255,255,255,0.07)', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 5 }}>
                 <span style={{ fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#94a3b8', fontFamily: "'Inter', sans-serif", fontWeight: 600, lineHeight: 1 }}>{label}</span>
                 <strong style={{ fontSize: 17, color, fontFamily: "'Inter', sans-serif", fontWeight: 700, letterSpacing: '-0.025em', lineHeight: 1 }}>{value}</strong>
               </div>
@@ -834,9 +1072,9 @@ function OptionsDesk({
             style={{ display: 'flex', gap: 0, position: 'relative', height: chartsHeight.px }}
           >
             {/* OI BAR CHART */}
-            <div ref={chartsRow.leftPanelRef} className="resizable-panel" style={{ ...PANEL, width: `${chartsRow.pct}%`, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            <div ref={chartsRow.leftPanelRef} className="resizable-panel options-panel" style={{ ...PANEL, width: `${chartsRow.pct}%`, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
-                <div><div style={EYE}>Open Interest</div><div style={TTL}>CE vs PE OI by Strike</div></div>
+                <div><div style={EYE}>Open Interest</div><div style={TTL}>CE vs PE OI Snapshot</div></div>
                 <div style={{ display: 'flex', gap: 12 }}>
                   <LEGEND color="#4ade80" label="Call OI" /><LEGEND color="#f87171" label="Put OI" /><LEGEND color="#7dd3fc" label="ATM" />
                 </div>
@@ -861,7 +1099,7 @@ function OptionsDesk({
             </div>
 
             {/* IV SMILE */}
-            <div className="resizable-panel" style={{ ...PANEL, flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            <div className="resizable-panel options-panel" style={{ ...PANEL, flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
                 <div>
                   <div style={EYE}>Implied Volatility</div>
@@ -902,7 +1140,7 @@ function OptionsDesk({
             style={{ display: 'flex', gap: 0, position: 'relative', height: bottomHeight.px }}
           >
             {/* IV RANK — drag right edge to resize width */}
-            <div ref={ivPanel.panelRef} className="resizable-panel" style={{ ...PANEL, width: ivPanel.px, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            <div ref={ivPanel.panelRef} className="resizable-panel options-panel" style={{ ...PANEL, width: ivPanel.px, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div style={EYE}>Volatility Regime</div>
               <div style={{ ...TTL, marginBottom: 6 }}>IV Rank</div>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
@@ -920,7 +1158,7 @@ function OptionsDesk({
               style={{ flex: 1, minWidth: 0, display: 'flex', gap: 0, position: 'relative' }}
             >
               {/* GREEKS */}
-              <div ref={bottomSplit.leftPanelRef} className="resizable-panel" style={{ ...PANEL, width: `${bottomSplit.pct}%`, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div ref={bottomSplit.leftPanelRef} className="resizable-panel options-panel" style={{ ...PANEL, width: `${bottomSplit.pct}%`, flexShrink: 0, marginRight: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
                 <div style={{ ...EYE, flexShrink: 0 }}>ATM Call — Sensitivities</div>
                 <div style={{ ...TTL, flexShrink: 0 }}>Greeks</div>
                 <ResponsiveContainer width="100%" height="100%">
@@ -938,9 +1176,9 @@ function OptionsDesk({
               </div>
 
               {/* OI AREA */}
-              <div className="resizable-panel" style={{ ...PANEL, flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div className="resizable-panel options-panel" style={{ ...PANEL, flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexShrink: 0 }}>
-                  <div><div style={EYE}>OI Distribution</div><div style={TTL}>CE vs PE — Overlap View</div></div>
+                  <div><div style={EYE}>OI Distribution</div><div style={TTL}>Latest CE vs PE OI</div></div>
                   <div style={{ display: 'flex', gap: 10 }}><LEGEND color="#4ade80" label="CE" /><LEGEND color="#f87171" label="PE" /></div>
                 </div>
                 <ResponsiveContainer width="100%" height="100%">
@@ -972,7 +1210,7 @@ function OptionsDesk({
           </div>
 
           {/* ── CHAIN TABLE ── */}
-          <div style={{ background: '#0b1018', border: '1px solid rgba(255,255,255,0.07)', overflow: 'hidden' }}>
+          <div className="options-chain" style={{ background: '#0b1018', border: '1px solid rgba(255,255,255,0.07)', overflow: 'hidden' }}>
             {/* header */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '9px 16px', borderBottom: '1px solid rgba(255,255,255,0.06)', background: 'rgba(255,255,255,0.02)' }}>
               <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
@@ -986,23 +1224,24 @@ function OptionsDesk({
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed', fontFamily: 'Inter, system-ui, sans-serif' }}>
                 <colgroup>
-                  {[10,8,8,10,14,10,8,8,10].map((w,i) => <col key={i} style={{ width: `${w}%` }} />)}
+                  {[9,9,7,7,9,12,9,7,7,9,9].map((w,i) => <col key={i} style={{ width: `${w}%` }} />)}
                 </colgroup>
                 <thead>
                   <tr style={{ background: 'rgba(74,222,128,0.04)' }}>
-                    {['OI (K)','IV %','Delta','LTP'].map((h,i) => (
+                    {['OI (K)','Vol','IV %','Delta','LTP'].map((h,i) => (
                       <th key={i} style={{ padding: '7px 10px', fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#4ade80', textAlign: 'right', borderBottom: '1px solid rgba(255,255,255,0.07)', fontWeight: 600 }}>{h}</th>
                     ))}
                     <th style={{ padding: '7px 10px', fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#7dd3fc', textAlign: 'center', borderBottom: '1px solid rgba(255,255,255,0.07)', fontWeight: 700, borderLeft: '1px solid rgba(125,211,252,0.18)', borderRight: '1px solid rgba(125,211,252,0.18)', background: 'rgba(125,211,252,0.05)' }}>Strike</th>
-                    {['LTP','Delta','IV %','OI (K)'].map((h,i) => (
+                    {['LTP','Delta','IV %','Vol','OI (K)'].map((h,i) => (
                       <th key={i} style={{ padding: '7px 10px', fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#f87171', textAlign: 'left', borderBottom: '1px solid rgba(255,255,255,0.07)', fontWeight: 600, background: 'rgba(248,113,113,0.04)' }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {oiData.map(({ strike, isATM }) => {
-                    const ce = chain.ce.find(l => l.strike === strike);
-                    const pe = chain.pe.find(l => l.strike === strike);
+                    const oiSrc = oiSnap ?? chain;
+                    const ce = oiSrc.ce.find(l => l.strike === strike);
+                    const pe = oiSrc.pe.find(l => l.strike === strike);
                     const N = (v: number | undefined, d = 2) =>
                       v != null && v !== 0
                         ? v.toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d })
@@ -1021,6 +1260,7 @@ function OptionsDesk({
                           <div style={{ position: 'absolute', inset: 0, right: 'auto', width: `${cePct}%`, background: 'rgba(74,222,128,0.08)', left: `${100-cePct}%` }} />
                           <span style={{ position: 'relative', color: '#4ade80', fontWeight: 500 }}>{N(ce?.oi ? ce.oi/1000 : undefined, 1)}</span>
                         </td>
+                        <td style={{ padding: '5px 10px', textAlign: 'right', fontSize: 11.5, color: '#86efac', fontWeight: 500 }}>{fmtQty(ce?.volume ?? 0)}</td>
                         <td style={{ padding: '5px 10px', textAlign: 'right', fontSize: 11.5, color: '#64748b' }}>{N(ce?.iv ? ce.iv*100 : undefined, 1)}</td>
                         <td style={{ padding: '5px 10px', textAlign: 'right', fontSize: 11.5, color: '#64748b' }}>{N(ce?.delta, 3)}</td>
                         <td style={{ padding: '5px 10px', textAlign: 'right', fontSize: 12, color: '#4ade80', fontWeight: 600 }}>{N(ce?.ltp, 2)}</td>
@@ -1034,6 +1274,7 @@ function OptionsDesk({
                         <td style={{ padding: '5px 10px', textAlign: 'left', fontSize: 12, color: '#f87171', fontWeight: 600 }}>{N(pe?.ltp, 2)}</td>
                         <td style={{ padding: '5px 10px', textAlign: 'left', fontSize: 11.5, color: '#64748b' }}>{N(pe?.delta, 3)}</td>
                         <td style={{ padding: '5px 10px', textAlign: 'left', fontSize: 11.5, color: '#64748b' }}>{N(pe?.iv ? pe.iv*100 : undefined, 1)}</td>
+                        <td style={{ padding: '5px 10px', textAlign: 'left', fontSize: 11.5, color: '#fca5a5', fontWeight: 500 }}>{fmtQty(pe?.volume ?? 0)}</td>
 
                         {/* PE OI + background bar */}
                         <td style={{ padding: '5px 10px', textAlign: 'left', position: 'relative', fontSize: 11.5 }}>
@@ -1209,7 +1450,7 @@ export default function App() {
             <div style={{ width: 32, height: 32, borderRadius: 10, background: 'rgba(120,201,255,0.12)', border: '1px solid rgba(120,201,255,0.18)', display: 'grid', placeItems: 'center', color: 'rgb(120,201,255)' }}>
               <Activity size={17} />
             </div>
-            <span className="wm" style={{ fontSize: 15 }}>AlphedgeOSS</span>
+            <span className="wm" style={{ fontSize: 15 }}>AlphahedgeOSS</span>
           </div>
           <span className="topbar-sep" />
           <nav className="topbar-nav" aria-label="Primary navigation">
@@ -1268,7 +1509,7 @@ export default function App() {
             <div style={{ width: 32, height: 32, borderRadius: 10, background: 'rgba(120,201,255,0.12)', border: '1px solid rgba(120,201,255,0.18)', display: 'grid', placeItems: 'center', color: 'rgb(120,201,255)' }}>
               <Activity size={17} />
             </div>
-            <span className="wm" style={{ fontSize: 15 }}>AlphedgeOSS</span>
+            <span className="wm" style={{ fontSize: 15 }}>AlphahedgeOSS</span>
           </div>
           <div className="chrome-right">
             <span className="chrome-meta">
@@ -1282,7 +1523,7 @@ export default function App() {
           <div className="eyebrow">
             <span className="live-dot" /> Secure Nubra Access
           </div>
-          <h1 className="landing-title">AlphedgeOSS</h1>
+          <h1 className="landing-title">AlphahedgeOSS</h1>
           <p className="landing-sub">
             Sign in to your Nubra account and access live options data, positioning intelligence, volume scanners, TradingView webhooks and a real-time scalper — all in one terminal.
           </p>
@@ -1307,7 +1548,7 @@ export default function App() {
           </div>
         </main>
         <footer className="auth-foot">
-          <span>Copyright 2026 AlphedgeOSS</span>
+          <span>Copyright 2026 AlphahedgeOSS</span>
           <span>Nubra REST Terminal</span>
         </footer>
       </div>
@@ -1328,7 +1569,7 @@ export default function App() {
             <div style={{ width: 32, height: 32, borderRadius: 10, background: 'rgba(120,201,255,0.12)', border: '1px solid rgba(120,201,255,0.18)', display: 'grid', placeItems: 'center', color: 'rgb(120,201,255)' }}>
               <Activity size={17} />
             </div>
-            <span className="wm" style={{ fontSize: 15 }}>AlphedgeOSS</span>
+            <span className="wm" style={{ fontSize: 15 }}>AlphahedgeOSS</span>
           </div>
           <div className="chrome-right">
             <span className="chrome-meta">
@@ -1471,7 +1712,7 @@ export default function App() {
         </div>
 
         <footer className="auth-foot">
-          <span>Copyright 2026 AlphedgeOSS</span>
+          <span>Copyright 2026 AlphahedgeOSS</span>
           <span>Nubra REST Terminal</span>
         </footer>
       </div>

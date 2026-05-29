@@ -3,3 +3,8 @@ dist/
 *.exe
 .env
 .env.*
+.gocache/
+.gopath/
+*.log
+target/
+rust-realtime/target/
