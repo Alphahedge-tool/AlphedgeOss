@@ -4,6 +4,7 @@ import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Cell,
 } from 'recharts';
+import MtmAnalyzer from './components/MtmAnalyzer/MtmAnalyzer';
 
 // ── RESIZABLE PANELS ─────────────────────────────────────────────────────────
 
@@ -138,7 +139,7 @@ function ResizeHandleV({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => 
 type AuthMethod = 'otp' | 'totp';
 type AuthStep = 'start' | 'otp' | 'totp' | 'mpin' | 'success';
 type Environment = 'PROD' | 'UAT';
-type View = 'landing' | 'login' | 'dashboard' | 'positioning' | 'scanner' | 'webhook' | 'scalper' | 'options';
+type View = 'landing' | 'login' | 'dashboard' | 'positioning' | 'scanner' | 'webhook' | 'scalper' | 'options' | 'mtm';
 type Theme = 'dark' | 'light';
 
 interface StartResponse {
@@ -1981,6 +1982,7 @@ export default function App() {
     const tabs: [View, string][] = [
       ['dashboard', 'Dashboard'],
       ['options', 'Options Desk'],
+      ['mtm', 'MTM Analyzer'],
       ['positioning', 'Positioning'],
       ['scanner', 'Scanner'],
       ['webhook', 'Webhook'],
@@ -2529,6 +2531,19 @@ export default function App() {
   /* ── OPTIONS DESK ── */
   if (view === 'options') {
     return <OptionsDesk theme={theme} session={session} renderNav={renderNav} />;
+  }
+
+  /* ── MTM ANALYZER ── */
+  if (view === 'mtm') {
+    return (
+      <div className="dash mtm-dash" data-theme={theme} style={{ overflow: 'hidden' }}>
+        {renderNav('mtm')}
+        <MtmAnalyzer
+          session={session}
+          theme={theme}
+        />
+      </div>
+    );
   }
 
   /* ── WEBHOOK ── */

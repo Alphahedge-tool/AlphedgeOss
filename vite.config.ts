@@ -14,6 +14,21 @@ export default defineConfig({
         target: 'http://localhost:3002',
         changeOrigin: true,
       },
+      // MTM Analyzer — REST APIs proxied to Go backend
+      '/api/historical': {
+        target: 'http://localhost:3002',
+        changeOrigin: true,
+      },
+      '/api/optionchain': {
+        target: 'http://localhost:3002',
+        changeOrigin: true,
+      },
+      '/api/instruments': {
+        target: 'http://localhost:3002',
+        changeOrigin: true,
+      },
+      // MTM Analyzer — Rust WS bridge (direct, no Vite WS intercept needed;
+      // browser connects to :3003 directly so no proxy entry required here)
     },
   },
 });

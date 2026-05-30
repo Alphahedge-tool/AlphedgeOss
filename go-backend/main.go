@@ -50,6 +50,10 @@ func main() {
 	mux.HandleFunc("/api/market/scanner", s.withCORS(s.marketScanner))
 	mux.HandleFunc("/api/market/option-chain", s.withCORS(s.optionChain))
 	mux.HandleFunc("/api/market/iv-rank", s.withCORS(s.ivRank))
+	// MTM Analyzer — thin reverse-proxies to Nubra REST using the caller's session token
+	mux.HandleFunc("/api/historical", s.withCORS(s.proxyHistorical))
+	mux.HandleFunc("/api/optionchain/", s.withCORS(s.proxyOptionChain))
+	mux.HandleFunc("/api/instruments/search", s.withCORS(s.proxyInstrumentsSearch))
 
 	addr := ":" + env("GO_AUTH_PORT", "3002")
 	log.Printf("Go Nubra auth server running on http://localhost%s", addr)
@@ -1200,4 +1204,87 @@ func isAllowedOrigin(origin string) bool {
 		origin == "http://127.0.0.1:8891" ||
 		origin == "http://localhost:5173" ||
 		origin == "http://127.0.0.1:5173"
+}
+
+// ── MTM ANALYZER REVERSE PROXIES ────────────────────────────────────────────
+// These three handlers forward MTM Analyzer REST calls to Nubra directly,
+// using the Authorization / x-device-id headers supplied by the browser.
+
+// proxyHistorical: POST /api/historical → Nubra POST /charts/timeseries
+func (s *server) proxyHistorical(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read body: " + err.Error()})
+		return
+	}
+	env := firstNonEmpty(r.Header.Get("x-nubra-env"), "PROD")
+	baseURL := nubraBaseURL(env)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, baseURL+"/charts/timeseries", bytes.NewReader(body))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", r.Header.Get("Authorization"))
+	req.Header.Set("x-device-id", firstNonEmpty(r.Header.Get("x-device-id"), "Nubra-OSS-mtm"))
+	s.forwardResponse(w, req)
+}
+
+// proxyOptionChain: GET /api/optionchain/{symbol}?exchange=NSE&expiry=... → Nubra GET /optionchains/{symbol}?...
+func (s *server) proxyOptionChain(w http.ResponseWriter, r *http.Request) {
+	symbol := strings.TrimPrefix(r.URL.Path, "/api/optionchain/")
+	symbol = strings.Trim(symbol, "/")
+	if symbol == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol required"})
+		return
+	}
+	env := firstNonEmpty(r.URL.Query().Get("env"), r.Header.Get("x-nubra-env"), "PROD")
+	baseURL := nubraBaseURL(env)
+	upstream := baseURL + "/optionchains/" + symbol + "?" + r.URL.RawQuery
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Authorization", r.Header.Get("Authorization"))
+	req.Header.Set("x-device-id", firstNonEmpty(r.Header.Get("x-device-id"), "Nubra-OSS-mtm"))
+	s.forwardResponse(w, req)
+}
+
+// proxyInstrumentsSearch: GET /api/instruments/search?q=...&limit=... → Nubra GET /refdata/search?q=...
+func (s *server) proxyInstrumentsSearch(w http.ResponseWriter, r *http.Request) {
+	env := firstNonEmpty(r.URL.Query().Get("env"), r.Header.Get("x-nubra-env"), "PROD")
+	baseURL := nubraBaseURL(env)
+	q := r.URL.Query().Get("q")
+	limit := firstNonEmpty(r.URL.Query().Get("limit"), "20")
+	upstream := baseURL + "/refdata/search?q=" + q + "&limit=" + limit
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Authorization", r.Header.Get("Authorization"))
+	req.Header.Set("x-device-id", firstNonEmpty(r.Header.Get("x-device-id"), "Nubra-OSS-mtm"))
+	s.forwardResponse(w, req)
+}
+
+// forwardResponse pipes an upstream Nubra response back to the browser.
+func (s *server) forwardResponse(w http.ResponseWriter, req *http.Request) {
+	resp, err := s.client.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }

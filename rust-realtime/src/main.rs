@@ -31,6 +31,9 @@ struct RealtimeQuery {
     #[serde(default = "default_stream")]
     stream: String,
     expiry: Option<String>,
+    /// interval for ohlcv stream, e.g. "1m", "5m", "15m"
+    #[serde(default = "default_interval")]
+    interval: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +84,45 @@ struct WebSocketMsgIndex {
     exchange: String,
     #[prost(int64, tag = "11")]
     volume_oi: i64,
+}
+
+// OHLCV candle bucket — from index_bucket stream
+#[derive(Clone, PartialEq, Message, Serialize)]
+struct BatchWebSocketIndexBucketMessage {
+    #[prost(int64, tag = "1")]
+    timestamp: i64,
+    #[prost(message, repeated, tag = "2")]
+    indexes: Vec<WebSocketMsgIndexBucket>,
+    #[prost(message, repeated, tag = "3")]
+    instruments: Vec<WebSocketMsgIndexBucket>,
+}
+
+#[derive(Clone, PartialEq, Message, Serialize)]
+struct WebSocketMsgIndexBucket {
+    #[prost(string, tag = "1")]
+    indexname: String,
+    #[prost(string, tag = "2")]
+    exchange: String,
+    #[prost(int32, tag = "3")]
+    interval: i32,
+    #[prost(int64, tag = "4")]
+    timestamp: i64,
+    #[prost(int64, tag = "5")]
+    open: i64,
+    #[prost(int64, tag = "6")]
+    high: i64,
+    #[prost(int64, tag = "7")]
+    low: i64,
+    #[prost(int64, tag = "8")]
+    close: i64,
+    #[prost(int64, tag = "9")]
+    bucket_volume: i64,
+    #[prost(int64, tag = "10")]
+    tick_volume: i64,
+    #[prost(int64, tag = "11")]
+    cumulative_volume: i64,
+    #[prost(int64, tag = "12")]
+    bucket_timestamp: i64,
 }
 
 #[derive(Clone, PartialEq, Message, Serialize)]
@@ -151,6 +193,10 @@ fn default_exchange() -> String {
 
 fn default_stream() -> String {
     "index".to_string()
+}
+
+fn default_interval() -> String {
+    "5m".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +403,7 @@ fn subscription_message(query: &RealtimeQuery) -> Result<String> {
     let exchange = query.exchange.to_uppercase();
     let instrument = query.instrument.to_uppercase();
 
+    // Option chain stream: batch_subscribe {token} option [{"exchange":"NSE","asset":"NIFTY","expiry":"20260602"}]
     if query.stream.eq_ignore_ascii_case("option") {
         let expiry = query
             .expiry
@@ -367,6 +414,15 @@ fn subscription_message(query: &RealtimeQuery) -> Result<String> {
         ));
     }
 
+    // OHLCV candle stream: batch_subscribe {token} index_bucket {"indexes":["NIFTY"]} 5m NSE
+    if query.stream.eq_ignore_ascii_case("ohlcv") || query.stream.eq_ignore_ascii_case("index_bucket") {
+        let interval = &query.interval;
+        return Ok(format!(
+            "batch_subscribe {token} index_bucket {{\"indexes\":[\"{instrument}\"]}} {interval} {exchange}"
+        ));
+    }
+
+    // Default: index LTP stream: batch_subscribe {token} index {"indexes":["NIFTY"]} NSE
     Ok(format!(
         "batch_subscribe {token} index {{\"indexes\":[\"{instrument}\"]}} {exchange}"
     ))
@@ -393,6 +449,14 @@ fn decode_market_binary(bytes: &[u8]) -> Result<Value> {
                         value: batch.encode_to_vec(),
                     }),
                 }
+            } else if let Ok(bucket) = BatchWebSocketIndexBucketMessage::decode(bytes) {
+                GenericData {
+                    key: "ohlcv".to_string(),
+                    data: Some(prost_types::Any {
+                        type_url: "BatchWebSocketIndexBucketMessage".to_string(),
+                        value: bucket.encode_to_vec(),
+                    }),
+                }
             } else {
                 let update = WebSocketMsgOptionChainUpdate::decode(bytes)
                     .context("decode direct WebSocketMsgOptionChainUpdate")?;
@@ -414,6 +478,20 @@ fn decode_market_binary(bytes: &[u8]) -> Result<Value> {
             "received_at_ms": received_at_ms,
         }));
     };
+
+    if generic.key.eq_ignore_ascii_case("ohlcv")
+        || any.type_url.ends_with("BatchWebSocketIndexBucketMessage")
+    {
+        let bucket = BatchWebSocketIndexBucketMessage::decode(any.value.as_slice())
+            .context("decode BatchWebSocketIndexBucketMessage")?;
+        return Ok(json!({
+            "type": "ohlcv",
+            "key": generic.key,
+            "type_url": any.type_url,
+            "received_at_ms": received_at_ms,
+            "payload": bucket,
+        }));
+    }
 
     if generic.key.eq_ignore_ascii_case("index")
         || any.type_url.ends_with("BatchWebSocketIndexMessage")
